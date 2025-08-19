@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>Endless Runner</title>
+  <style>
+    :root { --bg: #0e0f13; --fg: #ffffff; --accent: #7dd3fc; --accent2: #34d399; --danger: #f87171; --over:#a78bfa; }
+    html, body { height: 100%; }
+    body {
+      margin: 0; background: var(--bg); color: var(--fg);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Ubuntu, Cantarell, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      overflow: hidden; /* förhindra scroll på iPad */
+      touch-action: none; /* stäng av dubbel-tap zoom och gestures i spelet */
+      -webkit-user-select: none; user-select: none;
+    }
+    canvas { display: block; width: 100vw; height: 100vh; outline: none; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+  </style>
+</head>
+<body>
+  <span class="sr-only">Endless Runner – tangentbord: hoppa med pil upp, ducka genom att hålla pil ned. Touch: tryck höger sida för hopp, håll vänster sida för att ducka.</span>
+  <!-- Gör canvas fokuserbar så att tangenttryckningar alltid landar i sidan, även på iPad med tangentbord -->
+  <canvas id="game" tabindex="0"></canvas>
+  <script>
+    // ======= Grund-setup =======
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    let DPR = Math.max(1, window.devicePixelRatio || 1);
+    let W = 0, H = 0, groundY = 0;
+
+    function resize() {
+      W = Math.max(320, window.innerWidth);
+      H = Math.max(240, window.innerHeight);
+      // Sätt fysisk storlek i pixlar för skarp grafik på iPad (retina)
+      canvas.width = Math.floor(W * DPR);
+      canvas.height = Math.floor(H * DPR);
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0); // skala upp ritningen
+      groundY = H - Math.min(140, H * 0.22); // marknivå
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Säkerställ fokus så att keydown/keyup fungerar
+    function ensureFocus() {
+      if (document.activeElement !== canvas) canvas.focus();
+    }
+    window.addEventListener('load', ensureFocus);
+
+    // Fokusera vid varje pek-interaktion (bra på iPad)
+    ['pointerdown','pointerup','pointercancel'].forEach(ev => {
+      window.addEventListener(ev, () => ensureFocus(), { passive: false });
+    });
+
+    // ======= Hjälpfunktioner =======
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+    function rand(a, b) { return a + Math.random() * (b - a); }
+    function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh) {
+      return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+    }
+    function circleRectOverlap(cx, cy, cr, rx, ry, rw, rh) {
+      const nearestX = clamp(cx, rx, rx + rw);
+      const nearestY = clamp(cy, ry, ry + rh);
+      const dx = cx - nearestX;
+      const dy = cy - nearestY;
+      return (dx * dx + dy * dy) <= cr * cr;
+    }
+
+    // ======= Spelobjekt =======
+    const DUCK_CLEARANCE = 32; // höjden på öppningen under "hängande" hinder
+
+    class Player {
+      constructor() {
+        this.w = 44; this.hStand = 44; this.hDuck = 26;
+        this.h = this.hStand;
+        this.x = 80; this.y = 0; // y sätts i reset()
+        this.prevY = 0;
+        this.vy = 0;
+        this.onGround = false;
+        this.isDucking = false;
+        this.jumpCooldown = 0; // förhindra dubbel-registrering på touch
+      }
+      reset() {
+        this.h = this.hStand;
+        this.y = groundY - this.h;
+        this.prevY = this.y;
+        this.vy = 0; this.onGround = true; this.isDucking = false; this.jumpCooldown = 0;
+      }
+      canStandUp() {
+        const testY = groundY - this.hStand;
+        for (let i = 0; i < obstacles.length; i++) {
+          const o = obstacles[i];
+          if (rectsOverlap(this.x, testY, this.w, this.hStand, o.x, o.y, o.w, o.h)) return false;
+        }
+        return true;
+      }
+      setDucking(on) {
+        if (on) {
+          if (this.onGround) {
+            this.isDucking = true;
+            this.h = this.hDuck;
+            this.y = groundY - this.h;
+          }
+        } else {
+          // Försök resa sig – bara om det får plats
+          if (this.canStandUp()) {
+            this.isDucking = false;
+            this.h = this.hStand;
+            this.y = groundY - this.h;
+          }
+        }
+      }
+      update(dt) {
+        this.prevY = this.y; // spara för landningsdetektion
+        this.vy += GRAVITY * dt;
+        this.y += this.vy * dt;
+        if (this.y + this.h >= groundY) { this.y = groundY - this.h; this.vy = 0; this.onGround = true; }
+        else { this.onGround = false; }
+        if (this.jumpCooldown > 0) this.jumpCooldown -= dt;
+      }
+      tryJump() {
+        if (state !== 'RUNNING') return;
+        if (this.onGround && this.jumpCooldown <= 0) {
+          // sluta ducka när man hoppar
+          if (this.isDucking) { this.isDucking = false; this.h = this.hStand; this.y = groundY - this.h; }
+          this.vy = -JUMP;
+          this.onGround = false;
+          this.jumpCooldown = 0.08; // kort spärr
+        }
+      }
+      draw(ctx) {
+        // "Ansikte"-läge – styr både färg och min
+        const mode = !this.onGround ? 'jump' : (this.isDucking ? 'duck' : 'neutral');
+
+        // Kropp (rosa glow i luften)
+        ctx.save();
+        if (mode === 'jump') { ctx.fillStyle = '#ff4fd8'; ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 18; }
+        else { ctx.fillStyle = '#e5f2ff'; ctx.shadowBlur = 0; }
+        const r = this.isDucking ? 12 : 10;
+        roundRect(ctx, this.x, this.y, this.w, this.h, r, true);
+        ctx.restore();
+
+        // Ansikte
+        drawFace(ctx, this.x, this.y, this.w, this.h, mode);
+      }
+    }
+
+    class Obstacle {
+      constructor(x, w, h, type = 'ground') {
+        this.x = x; this.w = w; this.h = h; this.type = type; this.collected = false;
+        this.updateY();
+      }
+      updateY() {
+        if (this.type === 'ground') this.y = groundY - this.h; else this.y = groundY - DUCK_CLEARANCE - this.h; // hängande hinder
+      }
+      update(dt, speed) { this.x -= speed * dt; this.updateY(); }
+      offscreen() { return this.x + this.w < -50; }
+      draw(ctx) {
+        ctx.fillStyle = this.type === 'ground' ? '#f59e0b' : 'var(--over)';
+        roundRect(ctx, this.x, this.y, this.w, this.h, 6, true);
+        if (this.type !== 'ground') {
+          // liten "kedja"/häng-markering
+          ctx.globalAlpha = 0.25;
+          ctx.fillStyle = '#ffffff';
+          for (let k = 0; k < this.w; k += 12) ctx.fillRect(this.x + k + 4, this.y - 10, 2, 10);
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+
+    class Coin {
+      constructor(x, y) { this.x = x; this.y = y; this.r = 10; this.pulse = 0; this.collected = false; }
+      update(dt, speed) { this.x -= speed * dt; this.pulse += dt * 6; }
+      offscreen() { return this.x + this.r < -50; }
+      draw(ctx) {
+        ctx.beginPath();
+        ctx.arc(this.x, this.y + Math.sin(this.pulse) * 2, this.r, 0, Math.PI * 2);
+        ctx.closePath();
+        ctx.fillStyle = '#34d399';
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.stroke();
+      }
+    }
+
+    // Rundade rektanglar helper
+    function roundRect(ctx, x, y, w, h, r, fill = false, stroke = false) {
+      const rr = Math.min(r, w * 0.5, h * 0.5);
+      ctx.beginPath();
+      ctx.moveTo(x + rr, y);
+      ctx.arcTo(x + w, y, x + w, y + h, rr);
+      ctx.arcTo(x + w, y + h, x, y + h, rr);
+      ctx.arcTo(x, y + h, x, y, rr);
+      ctx.arcTo(x, y, x + w, y, rr);
+      ctx.closePath();
+      if (fill) ctx.fill();
+      if (stroke) ctx.stroke();
+    }
+
+    // "face" helper
+    function drawFace(ctx, x, y, w, h, mode) {
+      const cx = x + w * 0.5;
+      const eyeY = y + h * 0.38;
+      ctx.save();
+      ctx.fillStyle = '#0b1220';
+      ctx.strokeStyle = '#0b1220';
+
+      if (mode === 'jump') {
+        // stora runda ögon + glad mun
+        ctx.beginPath(); ctx.arc(x + w * 0.32, eyeY, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(x + w * 0.68, eyeY, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath();
+        ctx.arc(cx, y + h * 0.65, 10, 0, Math.PI); // leende
+        ctx.lineWidth = 3; ctx.stroke();
+      } else if (mode === 'duck') {
+        // kisande ögon + platt mun
+        ctx.fillRect(x + w * 0.28, eyeY - 1, 10, 2);
+        ctx.fillRect(x + w * 0.62, eyeY - 1, 10, 2);
+        ctx.fillRect(cx - 12, y + h * 0.68, 24, 3);
+      } else {
+        // neutral
+        ctx.beginPath(); ctx.arc(x + w * 0.34, eyeY, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.arc(x + w * 0.66, eyeY, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.fillRect(cx - 10, y + h * 0.68, 20, 2);
+      }
+      ctx.restore();
+    }
+
+    // ======= Speltilstånd =======
+    const GRAVITY = 1800;     // px/s^2
+    const JUMP = 650;         // px/s
+    const BASE_SPEED = 330;   // px/s
+    const SPEED_GROWTH = 22;  // px/s per minut
+
+    let player = new Player();
+    let obstacles = [];
+    let coins = [];
+    let spawnTimer = 0;
+    let time = 0; // total speltid i sek
+    let dist = 0; // distans i px
+    let score = 0;
+    let best = Number(localStorage.getItem('runnerBest') || 0);
+
+    let state = 'READY'; // READY, RUNNING, GAMEOVER
+
+    function resetGame() {
+      obstacles.length = 0; coins.length = 0;
+      spawnTimer = 0; time = 0; dist = 0; score = 0;
+      player.reset();
+    }
+
+    function startGame() { state = 'RUNNING'; resetGame(); }
+    function endGame() {
+      state = 'GAMEOVER';
+      best = Math.max(best, Math.floor(score));
+      localStorage.setItem('runnerBest', String(best));
+    }
+
+    // ======= Input =======
+    function startDuck() { if (state === 'RUNNING') player.setDucking(true); }
+    function stopDuck() { if (state === 'RUNNING') player.setDucking(false); }
+
+    function onJumpPress() {
+      if (state === 'READY') startGame();
+      else if (state === 'RUNNING') player.tryJump();
+      else if (state === 'GAMEOVER') { startGame(); }
+    }
+
+    // Hjälpfunktion för att känna igen piltangenter robust på olika webbläsare
+    function isArrowUp(e){ return e.code === 'ArrowUp' || e.key === 'ArrowUp' || e.key === 'Up'; }
+    function isArrowDown(e){ return e.code === 'ArrowDown' || e.key === 'ArrowDown' || e.key === 'Down'; }
+
+    function attachKeyListeners(target) {
+      target.addEventListener('keydown', (e) => {
+        if (isArrowUp(e)) { e.preventDefault(); onJumpPress(); }
+        if (isArrowDown(e)) { e.preventDefault(); startDuck(); }
+      }, { passive: false, capture: true });
+      target.addEventListener('keyup', (e) => {
+        if (isArrowDown(e)) { e.preventDefault(); stopDuck(); }
+      }, { passive: false, capture: true });
+    }
+
+    // Lägg på både window, document och canvas för säkerhets skull
+    attachKeyListeners(window);
+    attachKeyListeners(document);
+    attachKeyListeners(canvas);
+
+    // Touch / Pointer: höger sida = hopp, håll vänster sida = ducka
+    function isLeftSide(e) {
+      const x = (e.touches && e.touches[0]) ? e.touches[0].clientX : e.clientX;
+      return x < W * 0.4; // 40% vänster = ducka
+    }
+    window.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); ensureFocus();
+      if (state === 'READY') { startGame(); return; }
+      if (state === 'GAMEOVER') { startGame(); return; }
+      if (isLeftSide(e)) startDuck(); else onJumpPress();
+    }, { passive: false });
+    window.addEventListener('pointerup', (e) => { e.preventDefault(); stopDuck(); }, { passive: false });
+    window.addEventListener('pointercancel', (e) => { e.preventDefault(); stopDuck(); }, { passive: false });
+
+    // ======= Spawn =======
+    function spawnThings(speed) {
+      if (spawnTimer > 0) return;
+      const spacingBase = 0.9; // sekunder
+      const spacingRand = 0.9; // extra
+      spawnTimer = (spacingBase + Math.random() * spacingRand) * (330 / Math.max(330, speed));
+
+      // Välj typ av hinder
+      const makeOverhead = Math.random() < 0.35; // ~35% hängande hinder som kräver ducka
+      if (makeOverhead) {
+        const w = rand(60, 120);
+        const h = rand(18, 28);
+        obstacles.push(new Obstacle(W + 20, w, h, 'over'));
+      } else {
+        const w = rand(34, 60);
+        const h = rand(34, 100);
+        obstacles.push(new Obstacle(W + 20, w, h, 'ground'));
+      }
+
+      // 45% chans att spawna ett mynt i närheten
+      if (Math.random() < 0.45) {
+        const last = obstacles[obstacles.length - 1];
+        let y;
+        if (last.type === 'ground') {
+          const top = groundY - last.h - 50;
+          y = clamp(top - rand(10, 40), 60, groundY - 80);
+        } else {
+          // lägg myntet precis under hänghindret
+          y = groundY - DUCK_CLEARANCE + 20 - rand(0, 10);
+        }
+        coins.push(new Coin(last.x + last.w * 0.5, y));
+      }
+
+      // Ibland ett extra ensamt mynt
+      if (Math.random() < 0.25) {
+        coins.push(new Coin(W + rand(140, 260), clamp(groundY - rand(110, 160), 60, groundY - 60)));
+      }
+    }
+
+    // ======= Loop =======
+    let last = performance.now();
+    function loop(now) {
+      const dt = Math.min(0.033, (now - last) / 1000); // max 33ms för stabilitet
+      last = now;
+
+      // Rita bakgrund
+      ctx.clearRect(0, 0, W, H);
+      // Gradient himmel
+      const g = ctx.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, '#0b1220');
+      g.addColorStop(1, '#0e0f13');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+      // Mark
+      ctx.fillStyle = '#1f2937';
+      ctx.fillRect(0, groundY, W, H - groundY);
+      // Markmönster
+      ctx.globalAlpha = 0.25;
+      for (let x = 0; x < W; x += 40) { ctx.fillRect(x, groundY - 6, 24, 3); }
+      ctx.globalAlpha = 1;
+
+      if (state === 'RUNNING') {
+        time += dt;
+        const speed = BASE_SPEED + SPEED_GROWTH * (time / 60);
+        dist += speed * dt;
+        score = Math.floor(dist / 10);
+
+        // uppdatera spelare
+        player.update(dt);
+
+        // spawn
+        spawnTimer -= dt; spawnThings(speed);
+
+        // uppdatera hinder & mynt
+        for (let i = obstacles.length - 1; i >= 0; i--) {
+          const o = obstacles[i]; o.update(dt, speed);
+
+          // --- Ny logik: tillåten landning ovanpå markhinder ---
+          let landed = false;
+          if (o.type === 'ground') {
+            const overlapX = player.x + player.w > o.x && player.x < o.x + o.w;
+            const wasAbove = (player.prevY + player.h) <= (o.y + 1);
+            const falling = player.vy >= 0;
+            const crossedTop = (player.y + player.h) >= o.y;
+            if (overlapX && wasAbove && falling && crossedTop) {
+              player.y = o.y - player.h;
+              player.vy = 0;
+              player.onGround = true;
+              landed = true;
+            }
+          }
+
+          // Kollision som inte är landning => Game Over
+          if (!landed && rectsOverlap(player.x, player.y, player.w, player.h, o.x, o.y, o.w, o.h)) {
+            endGame();
+          }
+
+          if (o.offscreen()) obstacles.splice(i, 1);
+        }
+
+        for (let i = coins.length - 1; i >= 0; i--) {
+          const c = coins[i]; c.update(dt, speed);
+          if (!c.collected && circleRectOverlap(c.x, c.y, c.r, player.x, player.y, player.w, player.h)) {
+            c.collected = true; score += 25; coins.splice(i, 1);
+          } else if (c.offscreen()) { coins.splice(i, 1); }
+        }
+      }
+
+      // Rita objekt
+      for (const o of obstacles) o.draw(ctx);
+      for (const c of coins) c.draw(ctx);
+      player.draw(ctx);
+
+      // UI
+      drawHUD();
+
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    function drawHUD() {
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(12, 12, 300, 100);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '700 20px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+      ctx.fillText('Poäng: ' + Math.floor(score), 24, 38);
+      ctx.font = '400 16px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial';
+      ctx.fillText('Bästa: ' + Math.floor(best), 24, 62);
+
+      if (state === 'READY') {
+        drawCenterText('Endless Runner', 36, '#7dd3fc', 0, -56);
+        drawCenterText('Starta: tryck [↑] eller tappa', 18, '#ffffff', 0, -14);
+        drawCenterText('Hoppa: [↑]  •  Ducka: håll [↓]', 16, 'rgba(255,255,255,0.9)', 0, 14);
+        drawCenterText('Touch: höger = hoppa, vänster (håll) = ducka', 14, 'rgba(255,255,255,0.75)', 0, 40);
+      } else if (state === 'GAMEOVER') {
+        drawCenterText('Game Over', 36, '#f87171', 0, -20);
+        drawCenterText('Poäng: ' + Math.floor(score) + '  •  Bästa: ' + Math.floor(best), 18, '#ffffff', 0, 16);
+        drawCenterText('Tryck [↑] / tappa för att spela igen', 14, 'rgba(255,255,255,0.85)', 0, 42);
+      }
+    }
+
+    function drawCenterText(text, size, color, dx = 0, dy = 0) {
+      ctx.font = `700 ${size}px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial`;
+      ctx.fillStyle = color; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(text, W * 0.5 + dx, H * 0.45 + dy);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    }
+
+    // Initiera positioner när layouten är klar
+    resetGame();
+
+    // Paus när fliken är dold (bra för batteri)
+    document.addEventListener('visibilitychange', () => {
+      last = performance.now(); // nollställ delta när man kommer tillbaka
+    });
+  </script>
+</body>
+</html>
